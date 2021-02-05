@@ -23,6 +23,10 @@ type pipeline = { input : string list;
 let ( // ) = Filename.concat
 let ( @@ ) a b = if Filename.is_relative b then a // b else b
 
+let maybe_log maybe_out f = match maybe_out with
+  | None -> ()
+  | Some out -> f out
+
 let command ?stdin ?stdout args = { args = args;
 				    stdin = stdin;
 				    stdout = stdout }
@@ -54,18 +58,22 @@ let rec remove ?log file =
   try
     let st = stat file in
     match st.st_kind with
-	S_DIR ->
-	  Array.iter (fun name -> remove (file // name)) (Sys.readdir file);
-	  log ?? fprintf log "remove directory %S\n%!" file;
-	  rmdir file
+    | S_DIR ->
+      begin
+        Array.iter (fun name -> remove (file // name)) (Sys.readdir file);
+        maybe_log log (fun out -> fprintf out "remove directory %S\n%!" file);
+	rmdir file
+      end
       | S_REG
       | S_CHR
       | S_BLK
       | S_LNK
       | S_FIFO
       | S_SOCK ->
-	  log ?? fprintf log "remove file %S\n%!" file;
-	  Sys.remove file
+        begin
+          maybe_log log (fun out -> fprintf out "remove file %S\n%!" file);
+          Sys.remove file
+        end
   with e -> ()
 
 
@@ -100,24 +108,29 @@ let concat_cmd cmd = String.concat " " cmd.args
 
 let run_command ?log cmd =
   match cmd.args with
-      [] ->
-	log ?? fprintf log "empty command\n%!"; 0
+    | [] ->
+      begin
+        maybe_log log (fun out -> fprintf out "empty command\n%!");
+        0
+      end
     | prog :: _ ->
-	log ?? fprintf log "%s: %s\n%!" prog (concat_cmd cmd);
+      begin
+        maybe_log log (fun out -> fprintf out "%s: %s\n%!" prog (concat_cmd cmd));
 	let status =
 	  array_command ?stdin:cmd.stdin ?stdout:cmd.stdout
-	    prog (Array.of_list cmd.args) in
-	log ?? fprintf log "exit status %i\n%!" status;
+        prog (Array.of_list cmd.args) in
+        maybe_log log (fun out -> fprintf out "exit status %i\n%!" status);
 	status
+      end
 
 let exec ?log cmd =
-  log ?? fprintf log "%s\n%!" (concat_cmd cmd);
+  maybe_log log (fun out -> fprintf out "%s\n%!" (concat_cmd cmd));
   let status = run_command cmd in
-  log ?? fprintf log "exit status %i\n%!" status;
+  maybe_log log (fun out -> fprintf out "exit status %i\n%!" status);
   status
 
 let copy_file ?log ?(head = "") ?(tail = "") ?(force = false) src dst =
-  log ?? fprintf log "copy %S to %S\n%!" src dst;
+  maybe_log log (fun out -> fprintf out "copy %S to %S\n%!" src dst);
   if not force && Sys.file_exists dst then
     invalid_arg
       (sprintf "Pipeline.copy_file: destination file %s already exists" dst);
@@ -126,17 +139,25 @@ let copy_file ?log ?(head = "") ?(tail = "") ?(force = false) src dst =
     let oc = open_out_bin dst in
     try
       try
-	output_string oc head;
-	while true do
-	  output_char oc (input_char ic)
-	done
+        begin
+          output_string oc head;
+          while true do
+            output_char oc (input_char ic)
+	  done
+        end
       with End_of_file -> output_string oc tail
-    finally
-      close_out_noerr oc;
-      let perm = (stat src).st_perm in
-      chmod dst perm
-  finally
-    close_in_noerr ic
+    with exn1 ->
+      begin (* finally *)
+        close_out_noerr oc;
+        let perm = (stat src).st_perm in
+        chmod dst perm;
+        raise exn1
+      end
+  with exn2 ->
+    begin (* finally *)
+      close_in_noerr ic;
+      raise exn2
+    end
 
 let copy_files ?log ?force src dst l =
   List.iter
@@ -175,16 +196,22 @@ let run ?log
   let dir = temp_dir "ocamlpipeline" "" in
   try
     let base = Sys.getcwd () in
-    log ?? fprintf log "change directory %S\n%!" dir;
+    maybe_log log (fun out -> fprintf out "change directory %S\n%!" dir);
     Sys.chdir dir;
     before ();
     copy_files ?log base dir (List.map flip (match_files p.input input));
     let status = loop p.commands in
-    log ?? fprintf log "change directory %S\n%!" base;
+    maybe_log log (fun out -> fprintf out "change directory %S\n%!" base);
     after ();
     Sys.chdir base;
-    log ?? fprintf log "command pipeline exits with status %i\n%!" status;
+    maybe_log log
+      (fun out -> fprintf out "command pipeline exits with status %i\n%!" status);
     if status = 0 then
       copy_files ?log ~force:true dir base (match_files p.output output);
     status
-  finally remove ?log dir
+  with exn ->
+    begin
+      (* finally *)
+      remove ?log dir;
+      raise exn
+    end
